@@ -1,0 +1,1096 @@
+---
+title: "Proyecto final"
+subtitle: "Aprendizaje estadístico" 
+author:
+    name: Carlos Lezama, Alejandro Chávez, Jorge Rizo, Manuel Garduño
+    affiliation: Primavera 2021 | [ITAM](https://www.itam.mx/) | [EST 25134](https://github.com/agarbuno/aprendizaje-estadistico)
+output: 
+    html_document:
+        self_contained: true
+        theme: flatly
+        highlight: pygments
+        # code_folding: show
+        toc: yes
+        toc_depth: 4
+        toc_float: yes
+        css: css/preamble.css
+always_allow_html: true
+urlcolor: blue
+sansfont: Fira Sans
+monofont: Fira Code
+---
+
+```{r setup, include=FALSE}
+library(rmarkdown)
+library(tidyverse)
+library(rsample)
+library(tidymodels)
+library(knitr)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+options(digits = 2)
+library(patchwork)
+library(scales)
+library(doParallel)
+
+library(benchmarkme) # install.packages("benchmarkme") for sys specifications
+library(caret)       # install.packages("caret")
+library(e1071)       # install.packages("e1071") for SVM model
+library(finetune)    # install.packages("finetune")
+library(vip)         # install.packages("vip") for variable importance plotting
+library(MLmetrics)   # install.packages("MLmetrics") for R^2 score
+library(tictoc)      # install.packages("tictoc") for elapsed time in code
+library(xgboost)     # install.packages("xgboost") for XGBoost model
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  cache = TRUE,
+  fig.align = "center",
+  fig.width = 9,
+  fig.height = 6,
+  cache = TRUE,
+  dpi = 300
+)
+
+comma <- function(x)
+  format(x, digits = 2, big.mark = ",")
+
+theme_set(theme_linedraw())
+
+sin_lineas <-
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank())
+
+sin_leyenda <- theme(legend.position = "none")
+
+sin_ejes <-
+  theme(axis.ticks = element_blank(), axis.text = element_blank())
+
+numCores <- parallel::detectCores() -1
+doParallel::registerDoParallel(numCores) # Se deja libre un núcleo para el OS
+
+score <- c()
+```
+
+# Datos
+
+En esta práctica exploraremos una aplicación en astronomía. Los datos los hemos 
+tomado de [aquí](https://www.kaggle.com/basu369victor/prediction-of-asteroid-diameter)
+y buscaremos el mismo objetivo: predecir el diámetro de un asteroide en términos 
+de ciertas características medidas por instrumentos satelitales y otros sensores.
+
+```{r, out.width = "85%", echo=FALSE}
+knitr::include_graphics(
+    "https://upload.wikimedia.org/wikipedia/commons/6/63/Asteroids_by_size_and_number.svg"
+)
+```
+
+La base de datos proviene del JPL (*Jet Propulsion Laboratory*) en Caltech y
+pueden buscar los datos *crudos*
+[aquí](https://ssd.jpl.nasa.gov/sbdb_query.cgi). Nosotros usaremos una base de
+datos previamente procesada que contiene predictores para esta tarea.
+
+```{r data, echo=FALSE, message=FALSE}
+prefijo_testing  <- "test/features_0"
+prefijo_training <- "train/training_0"
+equipo_id        <- 4
+
+train <-
+  read_csv(paste(prefijo_training, equipo_id, ".csv", sep = "")) # Conjunto de entrenamiento
+test <-
+  read_csv(paste(prefijo_testing, equipo_id, ".csv", sep = ""))  # Conjunto de prueba
+
+train$index <- as.numeric(row.names(train))
+
+train %>%
+  ggplot(aes(x = index, y = diameter)) +
+  geom_point(size = 0.2) +
+  xlab("Observación") +
+  ylab("Diámetro") +
+  theme_minimal() +
+  scale_y_log10() +
+  sin_leyenda
+
+train <- subset(train, select = -c(index))
+```
+
+Los datos tienen severos problemas de valores atípicos en la escala original de
+diametro (medido en metros). Esto es consecuencia de la regla de potencias
+descrita en la imagen de arriba. Para realizar la predicción consideraremos utilizar
+los datos en escala logaritmica.
+
+Asimismo, algunos de los predictores podrían necesitar un
+tratamiento similar, pues algunos también incluyen valores atípicos
+y/o son atributos que sólo presentan valores positivos.
+
+# Objetivo
+
+El objetivo es construir modelos predictivos, compararlos y escoger el mejor
+de ellos. Nótese que este conjunto de datos es demasiado grande. Esto último
+implica una alta demanda computacional para equipos de uso diario como laptops
+o computadoras de escritorio de uso común. Con el fin de optimizar la demanda
+computacional del proyecto, hemos optado por desarrollarlo sobre una máquina
+virtual en la [Google Cloud Compute Engine](https://cloud.google.com/compute)
+con las siguientes características de sistema operativo, CPU (procesador y
+núcleos) y RAM respectivamente:
+
+```{r sys, echo=FALSE}
+sessionInfo()$running
+benchmarkme::get_cpu()$model_name
+benchmarkme::get_cpu()$no_of_cores
+benchmarkme::get_ram()
+```
+
+Por último, las predicciones se harán para un conjunto de prueba para el
+cual no tienen acceso a la variable objetivo. La métrica de evaluación será el 
+error cuadrático medio en escala logarítmica, es decir, 
+
+$$ \mathcal{L}_V(y, \hat y ) = \frac1m \sum \left(\log y_i - \log \hat y_i \right)^2\,.$$
+
+Por lo tanto, se adjuntará al proyecto un archivo `*.csv` con las predicciones
+en escala logarítmica: $\log(\text{diametro})$.
+
+# Exploración y limpieza
+
+En primer lugar, buscamos valores faltantes.
+
+```{r f_1, dependson=data}
+na_values <- c()
+for (i in 1:ncol(train)) {
+  na_values[i] <- sum(is.na(train[, i]))
+}
+na_values
+```
+
+Al no haber datos faltantes, no necesitamos imputar por ningún método.
+
+Como segundo paso, observamos que la mayoría de los atributos son numéricos,
+excepto por el atributo `class`.
+
+```{r f_2, dependson=data}
+count(train, class)
+```
+
+Es fácil ver que una gran mayoría de los asteroides observados son de la clase
+`MBA` tal que usar este atributo para nuestros modelos de predicción se vuelve
+inútil. Por lo tanto, redefinimos nuestros conjuntos de prueba y entrenamiento
+a escala logarítmica como sigue:
+
+```{r f_3, dependson=data}
+test_1 <- log(subset(test, select = -c(class)))
+train_1 <- log(subset(train, select = -c(class)))
+```
+
+El atributo `condition_code` se vuelve inútil después de convertirlo a la forma
+`log(condition_code)` pues toma valores desde $-\infty$. Nótese, por el mismo
+efecto, su correlación con el diámetro: `NaN`.
+
+```{r f_4}
+train_cor <- as.data.frame(cor(train_1))
+diameter_cor <- subset(train_cor, select = c(diameter))
+
+diameter_cor %>% arrange(abs(diameter))
+```
+
+Redefinimos nuestros conjuntos como:
+
+```{r f_5}
+test_set <- subset(test_1, select = -c(condition_code))
+train_set <- subset(train_1, select = -c(condition_code))
+```
+
+# Training
+
+Normalizamos todos los datos a través de nuestra *receta* para mejorar las
+predicciones de los modelos.
+
+```{r receta, dependson=data}
+receta <- recipe(diameter ~ ., train_set) %>% 
+  step_normalize(all_predictors()) %>% 
+  prep()
+```
+
+Todos los modelos siguen la siguiente estructura:
+
+- `modelo_n`, definimos el modelo a utilizar libre de parámetros; 
+- `vc`, dividimos nuestro conjunto de entrenamiento en bloques (por `vfold_cv()` o `bootstrap()`);
+- `flujo_n`, creamos el *workflow* con el `modelo_n` y nuestro nuestra *receta*;
+- `grid_n`, definimos nuestro *grid* de búsqueda de (hiper-)parámetros (por `grid_latin_hypercube()`, `grid_random()` o de forma manual como secuencia);
+- `metricas_n`, ejecutamos el proceso de ajuste de (hiper-)parámetros;
+- `mejor_n`, seleccionamos las mejores métricas son `select_best()`;
+- `modelo_final_n`, redefinimos el modelo con los parámetros óptimos;
+- `flujo_final_n`, creamos el *workflow* final con el `modelo_final_n` y nuestro nuestra *receta*;
+- `ajuste_final_n`, a través de nuestro `flujo_final_n` ajustamos nuestro modelo a nuestro conjunto de entrenamiento;
+- `pred_n`, sacamos nuestras predicciones del mismo conjunto de entrenamiento con nuestro modelo ajustado;
+- `p_n`, graficamos un histograma para comparar nuestras predicciones con las etiquetas reales;
+- `q_n`, hicimos un *scatter plot* de etiquetas reales contra nuestras predicciones;
+- `score[n]`, determinamos el coeficiente de determinación de cada una de las predicciones para escoger el mejor modelo a través de un *score*.
+
+## Regresión lineal regularizada
+
+### Ridge
+
+```{r, dependson=receta}
+# Modelo
+modelo_1 <- linear_reg(mixture = 0) %>%
+  set_engine("glmnet") %>%
+  set_mode("regression") %>%
+  fit(diameter ~ ., juice(receta))
+
+coefs_1 <- tidy(modelo_1$fit) %>%
+  filter(term != "(Intercept)")
+```
+Realizamos este *plot* para cerciorarnos que nuestra penalización $\lambda$ converja.
+```{r, echo=FALSE}
+ggplot(coefs_1, aes(x = lambda, y = estimate, colour = term)) +
+  geom_line(size = 0.1) +
+  scale_x_log10() +
+  geom_hline(yintercept = 0, lty = 2) +
+  sin_leyenda +
+  ylab("Coeficientes") +
+  xlab(expression(Penalización:lambda)) +
+  theme_minimal() +
+  sin_leyenda
+```
+
+#### Validación cruzada y ajuste de parámetros
+
+Por lo observado en la gráfica anterior, podemos optar con seguridad por un
+rango de penalización entre `1e-01` y `1e+04`.
+
+```{r, dependson=receta}
+modelo_1_regularizado <-
+  linear_reg(mixture = 0, penalty = tune()) %>%
+  set_engine("glmnet")
+
+flujo_1 <- workflow() %>%
+  add_model(modelo_1_regularizado) %>%
+  add_recipe(receta)
+
+bf_set_1 <-
+  parameters(penalty(range = c(-1, 4), trans = log10_trans()))
+
+grid_1 <- grid_regular(bf_set_1, levels = 50)
+
+vc <- vfold_cv(train_set)
+
+tic()
+metricas_1 <- tune_grid(
+  flujo_1,
+  resamples = vc,
+  grid = grid_1,
+  metrics = metric_set(rmse)
+)
+toc()
+
+mejor_1 <- metricas_1 %>% select_best()
+```
+
+#### Visualización de desempeño
+
+Nótese la baja variabilidad en el error de validación tal que, después de
+pruebas con intervalos más grandes al definido en el subapartado anterior,
+$\lambda \to 0$. Esto se debe a que anteriormente, hicimos una
+transformación logarítmica a nuestro conjunto de datos orignal.
+
+```{r, echo=FALSE}
+metricas_1 %>% collect_metrics() %>%
+  ggplot(aes(
+    x = penalty,
+    y = mean,
+    ymin = mean - std_err,
+    ymax = mean + std_err
+  )) +
+  geom_linerange() +
+  geom_point(size = 1.5, color = "#009194") +
+  scale_x_log10() +
+  ylab("Error de validación") +
+  xlab(expression(Penalización:lambda)) +
+  geom_vline(data = mejor_1, aes(xintercept = penalty), colour = "red") +
+  theme_minimal()
+```
+
+#### Predicciones
+
+```{r}
+modelo_final_1 <- finalize_model(modelo_1_regularizado, mejor_1)
+
+flujo_final_1 <-
+  workflow() %>% add_model(modelo_final_1) %>% add_recipe(receta)
+
+tic()
+ajuste_final_1 <- flujo_final_1 %>% fit(train_set)
+toc()
+
+pred_1 <- predict(ajuste_final_1, new_data = train_set)
+
+score[1] <-
+  R2_Score(y_pred = pred_1$.pred, y_true = train_set$diameter)
+```
+
+```{r, echo=FALSE}
+p_1 <- ggplot() +
+  geom_histogram(
+    aes(x = train_set$diameter, y = ..density..),
+    binwidth = 0.3,
+    fill = "#005377",
+    alpha = 0.4
+  ) +
+  geom_histogram(
+    aes(x = pred_1$.pred, y = ..density..),
+    binwidth = 0.3,
+    fill = "#EF476F",
+    alpha = 0.5
+  ) +
+  geom_density(aes(
+    x = train_set$diameter,
+    y = ..density..,
+    color = "Valores reales"
+  )) +
+  geom_density(aes(x = pred_1$.pred, y = ..density.., color = "Predicciones")) +
+  scale_colour_manual("", values = c("#EF476F", "#005377")) +
+  xlab("Diámetro") +
+  ylab("Densidad") +
+  ylim(0, 1) +
+  theme_minimal()
+
+q_1 <- ggplot() +
+  geom_point(aes(x = train_set$diameter, y = pred_1$.pred), color = "#EF476F") +
+  geom_abline(color = "#005377") +
+  xlab("Conjunto de entrenamiento") +
+  ylab("Predicciones") +
+  theme_minimal()
+
+p_1
+q_1
+```
+
+La puntuación $R^2$ obtenida con esta regresión es
+`r score[1]`.
+
+### Lasso
+
+```{r, dependson=receta}
+# Modelo
+modelo_2 <- linear_reg(mixture = 1) %>%
+  set_engine("glmnet") %>%
+  set_mode("regression") %>%
+  fit(diameter ~ ., juice(receta))
+
+coefs_2 <- tidy(modelo_2$fit) %>%
+  filter(term != "(Intercept)")
+```
+Realizamos este *plot* para cerciorarnos que nuestra penalización $\lambda$ converja.
+```{r, echo=FALSE}
+ggplot(coefs_2, aes(x = lambda, y = estimate, colour = term)) +
+  geom_line(size = 0.1) +
+  scale_x_log10() +
+  geom_hline(yintercept = 0, lty = 2) +
+  sin_leyenda +
+  ylab("Coeficientes") +
+  xlab(expression(Penalización:lambda)) +
+  theme_minimal() +
+  sin_leyenda
+```
+
+#### Validación cruzada y ajuste de parámetros
+
+Por lo observado en la gráfica anterior, podemos optar con seguridad por un
+rango de penalización entre `1e-02` y `1e+01`. Sin embargo, la convergencia no
+parece ser la deseada.
+
+```{r, dependson=receta}
+modelo_2_regularizado <-
+  linear_reg(mixture = 1, penalty = tune()) %>%
+  set_engine("glmnet")
+
+flujo_2 <- workflow() %>%
+  add_model(modelo_2_regularizado) %>%
+  add_recipe(receta)
+
+bf_set_2 <-
+  parameters(penalty(range = c(-2, 1), trans = log10_trans()))
+
+grid_2 <- grid_regular(bf_set_2, levels = 50)
+
+vc <- vfold_cv(train_set)
+
+tic()
+metricas_2 <- tune_grid(
+  flujo_2,
+  resamples = vc,
+  grid = grid_2,
+  metrics = metric_set(rmse)
+)
+toc()
+
+mejor_2 <- metricas_2 %>% select_best()
+```
+
+#### Visualización de desempeño
+
+En este caso, se puede observar el mismo efecto del apartado anterior, pues
+nuestro error de validación $\lambda \to 0$.
+
+```{r, echo=FALSE}
+metricas_2 %>% collect_metrics() %>%
+  ggplot(aes(
+    x = penalty,
+    y = mean,
+    ymin = mean - std_err,
+    ymax = mean + std_err
+  )) +
+  geom_linerange() +
+  geom_point(size = 1.5, color = "#009194") +
+  scale_x_log10() +
+  ylab("Error de validación") +
+  xlab(expression(Penalización:lambda)) +
+  geom_vline(data = mejor_2, aes(xintercept = penalty), colour = "red") +
+  theme_minimal()
+```
+
+#### Predicciones
+
+```{r}
+modelo_final_2 <- finalize_model(modelo_2_regularizado, mejor_2)
+
+flujo_final_2 <-
+  workflow() %>% add_model(modelo_final_2) %>% add_recipe(receta)
+
+tic()
+ajuste_final_2 <- flujo_final_2 %>% fit(train_set)
+toc()
+
+pred_2 <- predict(ajuste_final_2, new_data = train_set)
+
+score[2] <-
+  R2_Score(y_pred = pred_1$.pred, y_true = train_set$diameter)
+```
+
+```{r, echo=FALSE}
+p_2 <- ggplot() +
+  geom_histogram(
+    aes(x = train_set$diameter, y = ..density..),
+    binwidth = 0.3,
+    fill = "#005377",
+    alpha = 0.4
+  ) +
+  geom_histogram(
+    aes(x = pred_2$.pred, y = ..density..),
+    binwidth = 0.3,
+    fill = "#EF476F",
+    alpha = 0.5
+  ) +
+  geom_density(aes(
+    x = train_set$diameter,
+    y = ..density..,
+    color = "Valores reales"
+  )) +
+  geom_density(aes(x = pred_2$.pred, y = ..density.., color = "Predicciones")) +
+  scale_colour_manual("", values = c("#EF476F", "#005377")) +
+  xlab("Diámetro") +
+  ylab("Densidad") +
+  ylim(0, 1) +
+  theme_minimal()
+
+q_2 <- ggplot() +
+  geom_point(aes(x = train_set$diameter, y = pred_2$.pred), color = "#EF476F") +
+  geom_abline(color = "#005377") +
+  xlab("Conjunto de entrenamiento") +
+  ylab("Predicciones") +
+  theme_minimal() +
+  coord_fixed()
+
+p_2
+q_2
+```
+
+La puntuación $R^2$ obtenida con esta regresión es
+`r score[2]`.
+
+### Elastic net
+
+```{r, dependson=receta}
+# Modelo
+modelo_3 <-
+  linear_reg(mixture = tune(), penalty = tune()) %>%
+  set_engine("glmnet")
+```
+
+#### Validación cruzada y ajuste de parámetros
+
+```{r, dependson=receta}
+flujo_3 <- workflow() %>%
+  add_model(modelo_3) %>%
+  add_recipe(receta)
+
+bf_set_3 <-
+  parameters(penalty(range = c(-2, 2), trans = log10_trans()), mixture(range = c(0, 1)))
+
+grid_3 <- grid_regular(bf_set_3, levels = 50)
+
+vc <- vfold_cv(train_set)
+
+tic()
+metricas_3 <- tune_grid(
+  flujo_3,
+  resamples = vc,
+  grid = grid_3,
+  metrics = metric_set(rmse),
+  control = control_grid(allow_par = TRUE) # Aquí habilitamos el cómputo en paralelo.
+)
+toc()
+
+mejor_3 <- metricas_3 %>% select_best()
+```
+
+#### Visualización de desempeño
+
+En este caso, después de algunas pruebas, nos decidimos por difinir el intervalo
+de penalización de `1e-02` a `1e+02`.
+
+```{r, echo=FALSE}
+metricas_3 %>% autoplot() +
+  theme_minimal() +
+  sin_leyenda +
+  xlab(expression(Penalización:lambda)) +
+  ylab("Mezcla")
+```
+
+#### Predicciones
+
+```{r}
+modelo_final_3 <- finalize_model(modelo_3, mejor_3)
+
+flujo_final_3 <-
+  workflow() %>% add_model(modelo_final_3) %>% add_recipe(receta)
+
+tic()
+ajuste_final_3 <- flujo_final_3 %>% fit(train_set)
+toc()
+
+pred_3 <- predict(ajuste_final_3, new_data = train_set)
+
+score[3] <-
+  R2_Score(y_pred = pred_3$.pred, y_true = train_set$diameter)
+```
+
+```{r, echo=FALSE}
+p_3 <- ggplot() +
+  geom_histogram(
+    aes(x = train_set$diameter, y = ..density..),
+    binwidth = 0.3,
+    fill = "#005377",
+    alpha = 0.4
+  ) +
+  geom_histogram(
+    aes(x = pred_3$.pred, y = ..density..),
+    binwidth = 0.3,
+    fill = "#EF476F",
+    alpha = 0.5
+  ) +
+  geom_density(aes(
+    x = train_set$diameter,
+    y = ..density..,
+    color = "Valores reales"
+  )) +
+  geom_density(aes(x = pred_3$.pred, y = ..density.., color = "Predicciones")) +
+  scale_colour_manual("", values = c("#EF476F", "#005377")) +
+  xlab("Diámetro") +
+  ylab("Densidad") +
+  ylim(0, 1) +
+  theme_minimal()
+
+q_3 <- ggplot() +
+  geom_point(aes(x = train_set$diameter, y = pred_3$.pred), color = "#EF476F") +
+  geom_abline(color = "#005377") +
+  xlab("Conjunto de entrenamiento") +
+  ylab("Predicciones") +
+  theme_minimal()
+
+p_3
+q_3
+```
+
+La puntuación $R^2$ obtenida con esta regresión es
+`r score[3]`.
+
+## Árboles de decisión
+
+```{r, dependson=receta}
+# Modelo
+modelo_4 <-
+  decision_tree(cost_complexity = tune(), tree_depth = tune()) %>%
+  set_engine("rpart") %>%
+  set_mode("regression")
+```
+
+#### Validación cruzada y ajuste de parámetros
+
+```{r}
+grid_4 <- grid_regular(cost_complexity(),
+                          tree_depth(),
+                          levels = 5)
+
+vc <- vfold_cv(train_set)
+
+tic()
+metricas_4 <- tune_grid(
+  modelo_4,
+  diameter ~ .,
+  resamples = vc,
+  grid = grid_4,
+  metrics = metric_set(rmse),
+  control = control_grid(allow_par = TRUE) # Aquí habilitamos el cómputo en paralelo.
+)
+toc()
+
+mejor_4 <- metricas_4 %>% select_best()
+```
+
+#### Predicciones
+
+```{r}
+modelo_final_4 <- finalize_model(modelo_4, mejor_4)
+
+flujo_final_4 <-
+  workflow() %>% add_model(modelo_final_4) %>% add_recipe(receta)
+
+tic()
+ajuste_final_4 <- flujo_final_4 %>% fit(train_set)
+toc()
+
+pred_4 <- predict(ajuste_final_4, new_data = train_set)
+
+score[4] <-
+  R2_Score(y_pred = pred_4$.pred, y_true = train_set$diameter)
+```
+
+```{r, echo=FALSE}
+p_4 <- ggplot() +
+  geom_histogram(
+    aes(x = train_set$diameter, y = ..density..),
+    binwidth = 0.3,
+    fill = "#005377",
+    alpha = 0.4
+  ) +
+  geom_histogram(
+    aes(x = pred_4$.pred, y = ..density..),
+    binwidth = 0.3,
+    fill = "#EF476F",
+    alpha = 0.5
+  ) +
+  geom_density(aes(
+    x = train_set$diameter,
+    y = ..density..,
+    color = "Valores reales"
+  )) +
+  geom_density(aes(x = pred_4$.pred, y = ..density.., color = "Predicciones")) +
+  scale_colour_manual("", values = c("#EF476F", "#005377")) +
+  xlab("Diámetro") +
+  ylab("Densidad") +
+  ylim(0, 1) +
+  theme_minimal()
+
+q_4 <- ggplot() +
+  geom_point(aes(x = train_set$diameter, y = pred_4$.pred), color = "#EF476F") +
+  geom_abline(color = "#005377") +
+  xlab("Conjunto de entrenamiento") +
+  ylab("Predicciones") +
+  theme_minimal()
+
+p_4
+q_4
+```
+
+La puntuación $R^2$ obtenida con esta regresión es
+`r score[4]`.
+
+## Bosques aleatorios
+
+```{r, dependson=receta}
+# Modelo
+modelo_5 <-
+  rand_forest(mtry = tune(),
+              trees = tune(),
+              min_n = tune()) %>%
+  set_engine("ranger") %>%
+  set_mode("regression")
+```
+
+#### Validación cruzada y ajuste de parámetros
+
+```{r}
+vc <- bootstraps(train_set, times = 5)
+
+flujo_5 <-
+  workflow() %>%
+  add_recipe(receta) %>%
+  add_model(modelo_5)
+
+grid_5 <- parameters(
+   finalize(mtry(), select(train_set, -diameter)), # Utilizamos la función finalize()
+                                                   # para que tardara menos y evitar un warning.
+   trees(),
+   min_n()) %>% 
+   grid_random(5) # A diferencia de los *grid* de búsqueda de los demás modelos,
+                  # en esta ocasión lo definimos de forma aleatoria.
+
+tic()
+metricas_5 <- tune_race_anova(
+  flujo_5,
+  resamples = vc,
+  grid = grid_5,
+  metrics = metric_set(rmse),
+  control = control_race(allow_par = TRUE) # Aquí habilitamos el cómputo en paralelo.
+)
+toc()
+
+mejor_5 <- metricas_5 %>% select_best()
+```
+
+#### Predicciones
+
+```{r}
+modelo_final_5 <- finalize_model(modelo_5, mejor_5)
+
+flujo_final_5 <-
+  workflow() %>% add_model(modelo_final_5) %>% add_recipe(receta)
+
+tic()
+ajuste_final_5 <- flujo_final_5 %>% fit(train_set)
+toc()
+
+pred_5 <- predict(ajuste_final_5, new_data = train_set)
+
+score[5] <-
+  R2_Score(y_pred = pred_5$.pred, y_true = train_set$diameter)
+```
+
+```{r, echo=FALSE}
+p_5 <- ggplot() +
+  geom_histogram(
+    aes(x = train_set$diameter, y = ..density..),
+    binwidth = 0.3,
+    fill = "#005377",
+    alpha = 0.4
+  ) +
+  geom_histogram(
+    aes(x = pred_5$.pred, y = ..density..),
+    binwidth = 0.3,
+    fill = "#EF476F",
+    alpha = 0.5
+  ) +
+  geom_density(aes(
+    x = train_set$diameter,
+    y = ..density..,
+    color = "Valores reales"
+  )) +
+  geom_density(aes(x = pred_5$.pred, y = ..density.., color = "Predicciones")) +
+  scale_colour_manual("", values = c("#EF476F", "#005377")) +
+  xlab("Diámetro") +
+  ylab("Densidad") +
+  ylim(0, 1) +
+  theme_minimal()
+
+q_5 <- ggplot() +
+  geom_point(aes(x = train_set$diameter, y = pred_5$.pred), color = "#EF476F") +
+  geom_abline(color = "#005377") +
+  xlab("Conjunto de entrenamiento") +
+  ylab("Predicciones") +
+  theme_minimal()
+
+p_5
+q_5
+```
+
+La puntuación $R^2$ obtenida con esta regresión es
+`r score[5]`.
+
+## Máquinas de soporte vectorial
+Elegimos un modelo de máquinas de soporte vectorial con función de base radial. 
+```{r, dependson=receta}
+# Modelo
+modelo_6 <-
+  svm_rbf(cost = tune(),
+          rbf_sigma = tune()) %>%
+  set_engine("kernlab") %>%
+  set_mode("regression")
+```
+
+### Validación cruzada y ajuste de parámetros
+
+```{r}
+vc <- bootstraps(train_set, times = 5)
+
+flujo_6 <-
+  workflow() %>%
+  add_recipe(receta) %>%
+  add_model(modelo_6)
+
+grid_6 <- modelo_6 %>% parameters() %>% grid_latin_hypercube(size = 5) # Definimos nuestro grid de búsqueda
+                                                                       # como un hipercubo de tamaño n = 5.
+
+tic()
+metricas_6 <- tune_race_anova(
+  flujo_6,
+  resamples = vc,
+  grid = grid_6,
+  metrics = metric_set(rmse),
+  control = control_race(allow_par = TRUE) # Aquí habilitamos el cómputo en paralelo.
+)
+toc()
+
+mejor_6 <- metricas_6 %>% select_best()
+```
+
+### Predicciones
+
+```{r}
+modelo_final_6 <- finalize_model(modelo_6, mejor_6)
+
+flujo_final_6 <-
+  workflow() %>% add_model(modelo_final_6) %>% add_recipe(receta)
+
+tic()
+ajuste_final_6 <- flujo_final_6 %>% fit(train_set)
+toc()
+
+pred_6 <- predict(ajuste_final_6, new_data = train_set)
+
+score[6] <-
+  R2_Score(y_pred = pred_6$.pred, y_true = train_set$diameter)
+```
+
+```{r, echo=FALSE}
+p_6 <- ggplot() +
+  geom_histogram(
+    aes(x = train_set$diameter, y = ..density..),
+    binwidth = 0.3,
+    fill = "#005377",
+    alpha = 0.4
+  ) +
+  geom_histogram(
+    aes(x = pred_6$.pred, y = ..density..),
+    binwidth = 0.3,
+    fill = "#EF476F",
+    alpha = 0.5
+  ) +
+  geom_density(aes(
+    x = train_set$diameter,
+    y = ..density..,
+    color = "Valores reales"
+  )) +
+  geom_density(aes(x = pred_6$.pred, y = ..density.., color = "Predicciones")) +
+  scale_colour_manual("", values = c("#EF476F", "#005377")) +
+  xlab("Diámetro") +
+  ylab("Densidad") +
+  ylim(0, 1) +
+  theme_minimal()
+
+q_6 <- ggplot() +
+  geom_point(aes(x = train_set$diameter, y = pred_6$.pred), color = "#EF476F") +
+  geom_abline(color = "#005377") +
+  xlab("Conjunto de entrenamiento") +
+  ylab("Predicciones") +
+  theme_minimal()
+
+p_6
+q_6
+```
+
+La puntuación $R^2$ obtenida con esta regresión es
+`r score[6]`.
+
+## XGBoost
+
+```{r, dependson=receta}
+# Modelo
+modelo_7 <- boost_tree(
+  trees = 1000,
+  tree_depth = tune(),
+  min_n = tune(),
+  loss_reduction = tune(),
+  sample_size = tune(),
+  mtry = tune(),
+  learn_rate = tune(),
+) %>%
+  set_engine("xgboost") %>%
+  set_mode("regression")
+```
+
+### Validación cruzada y ajuste de parámetros
+
+```{r}
+vc <- vfold_cv(train_set, strata = diameter)
+
+grid_7 <- grid_latin_hypercube(  # Definimos nuestro grid de búsqueda como un
+                                 # hipercubo de tamaño 10.
+  tree_depth(),
+  min_n(),
+  loss_reduction(),
+  sample_size = sample_prop(),
+  finalize(mtry(), train_set),
+  learn_rate(),
+  size = 10
+)
+
+flujo_7 <- workflow() %>%
+  add_recipe(receta) %>%
+  add_model(modelo_7)
+
+tic()
+metricas_7 <- tune_race_anova(
+  flujo_7,
+  resamples = vc,
+  grid = grid_7,
+  metrics = metric_set(rmse),
+  control = control_race(allow_par = TRUE, parallel_over = "resamples") 
+) # Habilitamos el cómputo en paralelo solo en el remuestreo para reducir el
+  # tiempo de ejecución.
+toc()
+
+mejor_7 <- metricas_7 %>% select_best()
+```
+
+### Predicciones
+
+```{r}
+modelo_final_7 <- finalize_model(modelo_7, mejor_7)
+
+flujo_final_7 <-
+  workflow() %>% add_model(modelo_final_7) %>% add_recipe(receta)
+
+tic()
+ajuste_final_7 <- flujo_final_7 %>% fit(train_set)
+toc()
+
+pred_7 <- predict(ajuste_final_7, new_data = train_set)
+
+score[7] <-
+  R2_Score(y_pred = pred_7$.pred, y_true = train_set$diameter)
+```
+
+```{r, echo=FALSE}
+p_7 <- ggplot() +
+  geom_histogram(
+    aes(x = train_set$diameter, y = ..density..),
+    binwidth = 0.3,
+    fill = "#005377",
+    alpha = 0.4
+  ) +
+  geom_histogram(
+    aes(x = pred_7$.pred, y = ..density..),
+    binwidth = 0.3,
+    fill = "#EF476F",
+    alpha = 0.5
+  ) +
+  geom_density(aes(
+    x = train_set$diameter,
+    y = ..density..,
+    color = "Valores reales"
+  )) +
+  geom_density(aes(x = pred_7$.pred, y = ..density.., color = "Predicciones")) +
+  scale_colour_manual("", values = c("#EF476F", "#005377")) +
+  xlab("Diámetro") +
+  ylab("Densidad") +
+  ylim(0, 1) +
+  theme_minimal()
+
+q_7 <- ggplot() +
+  geom_point(aes(x = train_set$diameter, y = pred_7$.pred), color = "#EF476F") +
+  geom_abline(color = "#005377") +
+  xlab("Conjunto de entrenamiento") +
+  ylab("Predicciones") +
+  theme_minimal()
+
+p_7
+q_7
+```
+
+La puntuación $R^2$ obtenida con esta regresión es
+`r score[7]`.
+
+#### Importancia de las variables
+
+```{r, echo=FALSE}
+ajuste_final_7 %>%
+  pull_workflow_fit() %>%
+  vip(geom = "point")
+```
+
+# Modelo final
+
+```{r, echo=FALSE}
+modelos <-
+  c('Ridge',
+    'Lasso',
+    'Elastic Net',
+    'Decision Trees',
+    'Random Forests',
+    'SVM',
+    'XGBoost')
+
+df <- data.frame(model = modelos, score = score)
+
+ggplot(data = df, aes(x = model, y = score, fill = model)) +
+  geom_bar(stat = "identity") +
+  coord_cartesian(ylim = c(0.9, 1)) +
+  theme_minimal() +
+  sin_leyenda +
+  xlab("Modelo") +
+  ylab("Coeficiente de determinación")
+```
+
+## Conclusiones
+
+A pesar de que no fijamos una semilla para la aleatoriedad, el modelo de 
+Bosques Aleatorios obtuvo siempre el mejor desempeño y las mejores predicciones.
+Esto nos conduce a pensar que no existe multicolinealidad entre los atributos. Por
+lo tanto, nuestras predicciones en escala logarítmica son las siguientes:
+```{r}
+modelo_final <- ajuste_final_5
+write_csv(as.data.frame(predict(modelo_final, new_data = test_set)$.pred),
+          'predicciones_04.csv')
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
