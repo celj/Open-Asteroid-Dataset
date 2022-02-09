@@ -4,16 +4,19 @@ subtitle: "Aprendizaje estadístico"
 author:
     name: Carlos Lezama, Alejandro Chávez, Jorge Rizo, Manuel Garduño
     affiliation: Primavera 2021 | [ITAM](https://www.itam.mx/) | [EST 25134](https://github.com/agarbuno/aprendizaje-estadistico)
+date: "mayo 2021"
 output: 
     html_document:
         self_contained: true
         theme: flatly
         highlight: pygments
-        # code_folding: show
+        code_folding: show
         toc: yes
         toc_depth: 4
         toc_float: yes
         css: css/preamble.css
+        includes:
+          in_header: "header.html"
 always_allow_html: true
 urlcolor: blue
 sansfont: Fira Sans
@@ -21,27 +24,33 @@ monofont: Fira Code
 ---
 
 ```{r setup, include=FALSE}
-library(rmarkdown)
-library(tidyverse)
-library(rsample)
-library(tidymodels)
-library(knitr)
-library(ggplot2)
-library(dplyr)
-library(tidyr)
-options(digits = 2)
-library(patchwork)
-library(scales)
-library(doParallel)
+if (!require("pacman"))
+  install.packages("pacman")
 
-library(benchmarkme) # install.packages("benchmarkme") for sys specifications
-library(caret)       # install.packages("caret")
-library(e1071)       # install.packages("e1071") for SVM model
-library(finetune)    # install.packages("finetune")
-library(vip)         # install.packages("vip") for variable importance plotting
-library(MLmetrics)   # install.packages("MLmetrics") for R^2 score
-library(tictoc)      # install.packages("tictoc") for elapsed time in code
-library(xgboost)     # install.packages("xgboost") for XGBoost model
+pacman::p_load(
+  MLmetrics,
+  benchmarkme,
+  caret,
+  doParallel,
+  dplyr,
+  e1071,
+  finetune,
+  ggplot2,
+  glmnet,
+  knitr,
+  patchwork,
+  rmarkdown,
+  rsample,
+  scales,
+  tictoc,
+  tidymodels,
+  tidyr,
+  tidyverse,
+  vip,
+  xgboost
+)
+
+options(digits = 2)
 
 knitr::opts_chunk$set(
   echo = TRUE,
@@ -70,7 +79,8 @@ sin_ejes <-
 numCores <- parallel::detectCores() -1
 doParallel::registerDoParallel(numCores) # Se deja libre un núcleo para el OS
 
-score <- c()
+score <- c(
+)
 ```
 
 # Datos
@@ -233,7 +243,7 @@ Todos los modelos siguen la siguiente estructura:
 
 ```{r, dependson=receta}
 # Modelo
-modelo_1 <- linear_reg(mixture = 0) %>%
+modelo_1 <- linear_reg(mixture = 0, penalty = 0) %>%
   set_engine("glmnet") %>%
   set_mode("regression") %>%
   fit(diameter ~ ., juice(receta))
@@ -1055,42 +1065,3 @@ write_csv(as.data.frame(predict(modelo_final, new_data = test_set)$.pred),
           'predicciones_04.csv')
 
 ```
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
