@@ -154,7 +154,7 @@ Por último, las predicciones se harán para un conjunto de prueba para el
 cual no tienen acceso a la variable objetivo. La métrica de evaluación será el 
 error cuadrático medio en escala logarítmica, es decir, 
 
-$$ \mathcal{L}_V(y, \hat y ) = \frac1m \sum \left(\log y_i - \log \hat y_i \right)^2\,.$$
+$$ \mathscr{L}_V(y, \hat y ) = \frac1m \sum \left(\log y_i - \log \hat y_i \right)^2\,.$$
 
 Por lo tanto, se adjuntará al proyecto un archivo `*.csv` con las predicciones
 en escala logarítmica: $\log(\text{diametro})$.
