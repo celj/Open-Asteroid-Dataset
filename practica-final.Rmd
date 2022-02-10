@@ -37,7 +37,9 @@ pacman::p_load(
   finetune,
   ggplot2,
   glmnet,
+  kernlab,
   knitr,
+  lme4,
   patchwork,
   rmarkdown,
   rsample,
@@ -137,13 +139,9 @@ y/o son atributos que sólo presentan valores positivos.
 # Objetivo
 
 El objetivo es construir modelos predictivos, compararlos y escoger el mejor
-de ellos. Nótese que este conjunto de datos es demasiado grande. Esto último
-implica una alta demanda computacional para equipos de uso diario como laptops
-o computadoras de escritorio de uso común. Con el fin de optimizar la demanda
-computacional del proyecto, hemos optado por desarrollarlo sobre una máquina
-virtual en la [Google Cloud Compute Engine](https://cloud.google.com/compute)
-con las siguientes características de sistema operativo, CPU (procesador y
-núcleos) y RAM respectivamente:
+de ellos. Hemos desarrollado el código sobre una máquina con las siguientes
+características de sistema operativo, CPU (procesador y núcleos) y RAM
+respectivamente:
 
 ```{r sys, echo=FALSE}
 sessionInfo()$running
@@ -383,7 +381,7 @@ La puntuación $R^2$ obtenida con esta regresión es
 
 ```{r, dependson=receta}
 # Modelo
-modelo_2 <- linear_reg(mixture = 1) %>%
+modelo_2 <- linear_reg(mixture = 1, penalty = 0) %>%
   set_engine("glmnet") %>%
   set_mode("regression") %>%
   fit(diameter ~ ., juice(receta))
@@ -839,8 +837,8 @@ flujo_6 <-
   add_recipe(receta) %>%
   add_model(modelo_6)
 
-grid_6 <- modelo_6 %>% parameters() %>% grid_latin_hypercube(size = 5) # Definimos nuestro grid de búsqueda
-                                                                       # como un hipercubo de tamaño n = 5.
+# Definimos nuestro grid de búsqueda como un hipercubo de tamaño n = 5.
+grid_6 <- modelo_6 %>% parameters() %>% grid_latin_hypercube(size = 5)
 
 tic()
 metricas_6 <- tune_race_anova(
@@ -957,8 +955,8 @@ metricas_7 <- tune_race_anova(
   grid = grid_7,
   metrics = metric_set(rmse),
   control = control_race(allow_par = TRUE, parallel_over = "resamples") 
-) # Habilitamos el cómputo en paralelo solo en el remuestreo para reducir el
-  # tiempo de ejecución.
+) # Habilitamos el cómputo en paralelo solo en el remuestreo
+  # para reducir el tiempo de ejecución.
 toc()
 
 mejor_7 <- metricas_7 %>% select_best()
